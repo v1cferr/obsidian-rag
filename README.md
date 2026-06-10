@@ -191,7 +191,8 @@ rustup default stable   # toolchain Rust para o Tauri
 ## Como rodar (Fase 0 — CLI)
 
 Os comandos `uv run` abaixo rodam de dentro de `backend/` (da raiz do repo,
-acrescente `--project backend`).
+acrescente `--project backend`). Para indexar o vault inteiro de madrugada,
+siga [docs/ingestao-completa.md](docs/ingestao-completa.md).
 
 ```sh
 # 1. dependencias do backend (uma vez)
