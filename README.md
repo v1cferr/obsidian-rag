@@ -1,6 +1,6 @@
 # obsidian-rag
 
-Chatbot pessoal com RAG sobre o vault do Obsidian (sincronizado via Dropbox), com citacao das fontes em cada resposta. Roda localmente no Arch Linux, com deploy web planejado para `obsidian.v1cferr.dev`.
+Chatbot pessoal com RAG sobre o vault do Obsidian (sincronizado via Dropbox), com citacao das fontes em cada resposta. Stack 100% local (Ollama + Whisper) rodando no Arch Linux, app desktop em Tauri e, no futuro, deploy web em `obsidian.v1cferr.dev` servido por um servidor on-prem.
 
 > Status: fase de planejamento/arquitetura. Nada implementado ainda.
 
@@ -20,7 +20,8 @@ Funcionais:
 Nao funcionais:
 
 - Plataforma principal: Arch Linux (desktop).
-- Futuro: acesso via web em `obsidian.v1cferr.dev`, com autenticacao (o conteudo e pessoal).
+- Privacidade: nada do vault sai da maquina — LLM, embeddings, visao e transcricao rodam localmente (Ollama/Whisper).
+- Futuro: acesso via web em `obsidian.v1cferr.dev` servido por servidor on-prem, com autenticacao (o conteudo e pessoal).
 - O indice nao deve poluir o vault nem ser sincronizado pelo Dropbox.
 
 ## Conteudo do vault (levantamento real)
@@ -52,9 +53,9 @@ O motor de RAG escolhido ([RAG-Anything](https://github.com/HKUDS/RAG-Anything))
 
 A mesma dupla backend + frontend atende os tres cenarios sem reescrita:
 
-1. **Local (agora):** servidor roda na maquina, UI abre no navegador em `localhost`.
-2. **Desktop (opcional, depois):** wrapper Tauri apontando para a mesma UI, com o backend como *sidecar*.
-3. **Web (futuro):** mesmo backend + frontend num VPS atras de proxy reverso com TLS e autenticacao.
+1. **Local (agora):** backend roda como servico do usuario (`systemd --user`), UI abre no navegador em `localhost`.
+2. **Desktop (decidido: Tauri):** app Tauri empacota a mesma SPA e consome o backend local. Empacotar o Python como *sidecar* fica como opcao futura de distribuicao — PyInstaller com stack de ML (torch/MinerU) gera binarios de varios GB; como o Ollama ja roda como servico separado de qualquer forma, o modelo "servicos locais + UI fina" e mais simples e consistente.
+3. **Web (futuro):** mesma dupla no servidor on-prem, atras de proxy reverso com TLS e autenticacao.
 
 ### Comparativo dos frameworks desktop
 
@@ -67,7 +68,7 @@ A mesma dupla backend + frontend atende os tres cenarios sem reescrita:
 | Sidecar p/ backend Python | Manual | Suporte nativo (sidecar) | Limitado |
 | Reaproveita a UI web | Sim | Sim | Sim |
 
-**Decisao:** comecar **sem framework desktop** (web-first). Se/quando uma janela dedicada fizer sentido, usar **Tauri** — binario pequeno, WebKitGTK nativo no Arch, suporte oficial a sidecar para empacotar o backend Python.
+**Decisao: Tauri** — binario pequeno, WebKitGTK nativo no Arch e suporte oficial a sidecar caso um dia o backend precise ser empacotado junto. A UI continua web-first: a mesma SPA roda no navegador, no app Tauri e na web.
 
 - *Electron descartado:* o peso do Chromium nao compra nada aqui, ja que toda a logica pesada fica no Python; a forca do Electron (integracao Node no processo principal) nao seria usada.
 - *Neutralino descartado:* leve, porem ecossistema imaturo e API limitada para orquestrar um processo backend.
@@ -85,21 +86,51 @@ Base: [RAG-Anything](https://github.com/HKUDS/RAG-Anything) (HKUDS), construido 
 2. **Indexacao**
    - LightRAG constroi grafo de conhecimento + embeddings, preservando `file_path` como metadado de cada chunk (insumo das citacoes).
    - Diretorio de trabalho do indice **fora do vault** (ex.: `~/.local/share/obsidian-rag/`), para nao ser sincronizado pelo Dropbox.
-   - Indexacao usa LLM para extrair entidades/relacoes: prever modelo barato para ingestao e modelo melhor para resposta.
+   - Indexacao usa LLM para extrair entidades/relacoes (uma chamada por chunk): com Ollama, vale um modelo menor/rapido na ingestao e um maior na resposta.
 3. **Sincronizacao**
    - Watcher (inotify via `watchdog`) no diretorio do vault, com debounce (o Dropbox grava arquivos em partes).
    - Reindexacao incremental por hash/mtime; remocao de documentos deletados.
+   - Granularidade por arquivo: a ingestao completa acontece uma unica vez; depois, arquivo novo entra sozinho no indice, arquivo alterado e re-inserido sozinho (delete + insert daquele documento no LightRAG) e o restante do indice nao e tocado.
+   - Dentro de um arquivo alterado, o custo e ~proporcional ao que mudou: chunks sao identificados por hash de conteudo e o cache de LLM do LightRAG faz trechos inalterados custarem quase zero — so o conteudo realmente novo paga extracao.
 4. **Consulta**
    - Endpoint de chat no FastAPI chama a query do RAG-Anything (modos do LightRAG: local/global/hybrid; consultas VLM quando envolver imagens).
 
 ### Modelos (LLM e embeddings)
 
-RAG-Anything usa interface compativel com OpenAI, o que deixa duas rotas (intercambiaveis via configuracao):
+**Decisao: local via Ollama**, pelo endpoint compativel com OpenAI (`http://localhost:11434/v1`). Privacidade total e custo zero por token. A URL base fica em configuracao: quando o servidor on-prem existir, migrar = apontar para outra maquina, sem mudar codigo.
 
-- **API em nuvem:** melhor qualidade de resposta e de extracao na ingestao.
-- **Local via Ollama:** privacidade total (notas pessoais nao saem da maquina), custo zero por token; qualidade dependente do hardware.
+Hardware de referencia: **RTX 3050 8 GB** + i5-11400 + 16 GB RAM (Ollama com CUDA ja instalado).
 
-Decisao fica para a fase de implementacao; o codigo deve tratar provider como configuracao, nao como acoplamento.
+Conjunto inicial (validar qualidade e velocidade na Fase 0):
+
+| Papel | Modelo | Observacao |
+| --- | --- | --- |
+| Extracao na ingestao | `qwen3:4b` (baixar) | milhares de chamadas com contexto de 32k: modelo pequeno mantem peso + KV cache inteiros na VRAM e acelera a ingestao |
+| Chat/resposta | `qwen3.5` (6.6 GB, ja baixado) ou `llama3.1:8b` (ja baixado) | com contexto 32k o qwen3.5 faz offload parcial para RAM; comparar os dois na Fase 0 |
+| Embeddings | `bge-m3` (baixar) | multilingue — o `nomic-embed-text` ja baixado e focado em ingles, fraco para vault em PT-BR |
+| Visao (imagens/VLM) | `gemma4:e4b-it-qat` (baixar, 6.1 GB) | geracao nova, multimodal (imagem e audio), 4.5B efetivos — cabe nos 8 GB; alternativa mais leve: `gemma4:e2b-it-qat` (4.3 GB) |
+| Transcricao de audio | faster-whisper `large-v3` (int8) | fora do Ollama; familia Whisper e o estado da arte em PT-BR. O `gemma4:e4b` tambem aceita audio — vale testar contra o Whisper na Fase 0 |
+
+```sh
+ollama pull qwen3:4b && ollama pull bge-m3 && ollama pull gemma4:e4b-it-qat
+```
+
+Ajustes no servico do Ollama para caber contexto de 32k em 8 GB — requisito documentado pelo LightRAG: os prompts de extracao estouram o contexto padrao do Ollama e a qualidade do grafo degrada silenciosamente:
+
+```ini
+# systemctl edit ollama  ->  [Service]
+Environment="OLLAMA_CONTEXT_LENGTH=32768"
+Environment="OLLAMA_FLASH_ATTENTION=1"
+Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
+Environment="OLLAMA_NUM_PARALLEL=1"
+```
+
+Notas de capacidade:
+
+- Um modelo pesado por vez na GPU (o Ollama descarrega/carrega sozinho conforme a chamada); `bge-m3` e pequeno e convive com o modelo de extracao.
+- `gemma4:12b` (7.6 GB) e maiores nao servem nesta GPU: so os pesos ja ocupam os 8 GB, sem sobrar nada para o KV cache de 32k, e o offload pesado cai numa RAM ja saturada. Modelos 12b+ ficam para o servidor on-prem.
+- Com 16 GB de RAM o sistema ja opera perto do limite no uso diario: rodar a ingestao completa (324 PDFs) em lote/madrugada — MinerU e o offload do Ollama empurram o excedente para ZRAM/swap.
+- A Fase 0 mede tokens/s e projeta o tempo total de ingestao a partir de um subconjunto, antes de indexar o vault inteiro.
 
 ## Citacao de fontes
 
@@ -117,44 +148,58 @@ Design previsto:
 | Camada | Escolha |
 | --- | --- |
 | Motor RAG | RAG-Anything + LightRAG (Python 3.10+) |
+| LLM/embeddings/visao | Ollama local (endpoint OpenAI-compativel); futuramente em servidor on-prem |
 | Parsers | MinerU (PDF/imagem), Docling (Office), faster-whisper (audio) |
 | Backend/API | FastAPI + uvicorn; gerenciado com `uv` |
-| Frontend | SPA (Vite + React + TypeScript + Tailwind) servida como estatico pelo proprio FastAPI |
-| Desktop (opcional) | Tauri v2 com backend como sidecar |
+| Frontend web | SPA (Vite + React + TypeScript + Tailwind) em `frontend/web` |
+| Desktop | Tauri v2 em `frontend/desktop`, empacotando a mesma SPA |
+| Monorepo | `uv` (backend) + pnpm workspaces (frontends) |
 | Watcher | watchdog (inotify) |
-| Deploy web (futuro) | VPS + Caddy/Traefik (TLS) + autenticacao em `obsidian.v1cferr.dev` |
+| Deploy web (futuro) | servidor on-prem + Caddy/Traefik (TLS) + autenticacao em `obsidian.v1cferr.dev` |
 
-## Estrutura planejada do repositorio
+## Estrutura do monorepo
 
 ```text
 obsidian-rag/
-  backend/
-    app/            # FastAPI: rotas de chat, ingestao, fontes
-    rag/            # integracao RAG-Anything, watcher, transcricao de audio
+  backend/              # FastAPI + RAG-Anything (gerenciado com uv)
+    app/                # rotas: chat, ingestao, fontes
+    rag/                # integracao RAG-Anything, watcher, transcricao de audio
     pyproject.toml
-  frontend/         # SPA do chat (Vite + React + TS)
-  desktop/          # (futuro) wrapper Tauri
-  docs/             # decisoes de arquitetura (ADRs)
+  frontend/
+    web/                # SPA do chat (Vite + React + TS + Tailwind)
+    desktop/            # app Tauri v2 (src-tauri/), consome a SPA de web/
+  docs/                 # decisoes de arquitetura (ADRs)
+  pnpm-workspace.yaml
 ```
 
 ## Roadmap
 
-- [ ] **Fase 0 — Prova de conceito:** script CLI que indexa um subconjunto do vault com RAG-Anything e responde perguntas com `file_path` das fontes no terminal. Valida qualidade e custo antes de qualquer UI.
+- [ ] **Fase 0 — Prova de conceito:** script CLI que indexa um subconjunto do vault com RAG-Anything sobre o Ollama e responde perguntas com `file_path` das fontes no terminal. Valida qualidade da extracao, tempo de ingestao e VRAM antes de qualquer UI.
 - [ ] **Fase 1 — Backend:** FastAPI com endpoints de chat e status de indexacao; ingestao completa do vault; transcricao dos `.opus`; reindexacao incremental com watcher.
-- [ ] **Fase 2 — UI de chat:** SPA com streaming da resposta e painel de fontes clicaveis (`obsidian://` no local).
-- [ ] **Fase 3 — Desktop (opcional):** wrapper Tauri com sidecar, se a janela dedicada se mostrar util.
-- [ ] **Fase 4 — Web:** deploy em `obsidian.v1cferr.dev` com autenticacao; estrategia de sincronizacao do vault no servidor (cliente Dropbox headless ou `rclone`).
+- [ ] **Fase 2 — UI de chat:** SPA em `frontend/web` com streaming da resposta e painel de fontes clicaveis (`obsidian://` no local).
+- [ ] **Fase 3 — Desktop:** app Tauri em `frontend/desktop` empacotando a SPA, consumindo o backend rodando como servico local.
+- [ ] **Fase 4 — Web:** deploy no servidor on-prem (backend + Ollama) com TLS e autenticacao em `obsidian.v1cferr.dev`; sincronizacao do vault no servidor (cliente Dropbox headless ou `rclone`).
 
 ## Pre-requisitos (Arch Linux)
 
 ```sh
-sudo pacman -S --needed python uv nodejs npm libreoffice-fresh ffmpeg
-# GPU (opcional, acelera MinerU/Whisper): drivers CUDA/ROCm conforme hardware
+sudo pacman -S --needed python uv nodejs npm pnpm rustup webkit2gtk-4.1 base-devel ollama libreoffice-fresh ffmpeg
+rustup default stable   # toolchain Rust para o Tauri
+# GPU: trocar ollama por ollama-cuda ou ollama-rocm conforme hardware (acelera LLM/MinerU/Whisper)
 ```
+
+## Decisoes tomadas
+
+- UI desktop: **Tauri v2** (Electron e Neutralino descartados — ver comparativo acima).
+- Layout: **monorepo** com `backend/`, `frontend/web/` e `frontend/desktop/`.
+- Modelos: **Ollama local**; servidor on-prem no futuro reaproveita a mesma configuracao trocando a URL base.
+- Transcricao de audio: **familia Whisper** via faster-whisper (melhor suporte a PT-BR entre os ASR locais).
+- Conjunto inicial de modelos dimensionado para a **RTX 3050 8 GB** (tabela na secao Modelos).
 
 ## Decisoes em aberto
 
-- Provider de LLM/embeddings: API em nuvem vs Ollama local (criterio: privacidade x qualidade x custo de indexar ~324 PDFs).
+- Fase 0 confirma: modelo de resposta (`qwen3.5` com offload parcial vs `llama3.1:8b` inteiro na VRAM), se o `gemma4:e4b-it-qat` da conta da visao e se ele compete com o Whisper na transcricao em PT-BR.
 - Modo de consulta padrao do LightRAG (hybrid parece o melhor ponto de partida).
+- Distribuicao do desktop: backend como servico local vs sidecar empacotado (PyInstaller) — so importa se o app for distribuido para terceiros.
 - Autenticacao na fase web (Authelia, OIDC ou passkey simples).
-- Como sincronizar o vault no servidor na fase web.
+- Como sincronizar o vault no servidor on-prem na fase web.
