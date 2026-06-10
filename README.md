@@ -161,13 +161,13 @@ Design previsto:
 
 ```text
 obsidian-rag/
-  backend/              # FastAPI + RAG-Anything (gerenciado com uv)
-    app/                # rotas: chat, ingestao, fontes
-    rag/                # integracao RAG-Anything, watcher, transcricao de audio
+  backend/              # Python (uv): nucleo RAG + CLI (Fase 0), FastAPI na Fase 1
+    rag/                # config, scanner do vault, engine RAG-Anything/Ollama, CLI
+    app/                # (Fase 1) rotas FastAPI: chat, ingestao, fontes
     pyproject.toml
   frontend/
-    web/                # SPA do chat (Vite + React + TS + Tailwind)
-    desktop/            # app Tauri v2 (src-tauri/), consome a SPA de web/
+    web/                # (Fase 2) SPA do chat (Vite + React + TS + Tailwind)
+    desktop/            # (Fase 3) app Tauri v2 (src-tauri/), consome a SPA de web/
   docs/                 # decisoes de arquitetura (ADRs)
   pnpm-workspace.yaml
 ```
@@ -187,6 +187,41 @@ sudo pacman -S --needed python uv nodejs npm pnpm rustup webkit2gtk-4.1 base-dev
 rustup default stable   # toolchain Rust para o Tauri
 # GPU: trocar ollama por ollama-cuda ou ollama-rocm conforme hardware (acelera LLM/MinerU/Whisper)
 ```
+
+## Como rodar (Fase 0 — CLI)
+
+Os comandos `uv run` abaixo rodam de dentro de `backend/` (da raiz do repo,
+acrescente `--project backend`).
+
+```sh
+# 1. dependencias do backend (uma vez)
+cd backend && uv sync
+
+# 2. modelos locais (uma vez)
+ollama pull qwen3:4b && ollama pull bge-m3 && ollama pull gemma4:e4b-it-qat
+
+# 3. ver o que seria indexado (nao toca o indice)
+uv run obsidian-rag scan
+
+# 4. indexar um subconjunto (ex.: 20 notas Markdown)
+uv run obsidian-rag index --ext md --limit 20
+
+# 5. perguntar, com as fontes do vault na saida
+uv run obsidian-rag ask "Sobre o que falam minhas notas de novembro de 2024?"
+
+# extras
+uv run obsidian-rag status              # configuracao efetiva + estado do indice
+uv run obsidian-rag index --dry-run     # lista sem indexar
+uv run obsidian-rag ask "..." --show-context
+```
+
+Notas de implementacao da Fase 0:
+
+- Defaults: vault em `~/Dropbox/Obsidian/v1cferr`, indice em `~/.local/share/obsidian-rag/`. Tudo sobrescrevivel por variaveis `OBSIDIAN_RAG_*` (ver `backend/.env.example`).
+- `.md/.txt/.tex` entram por **insercao direta de texto** no LightRAG. O caminho padrao do RAG-Anything converteria a nota em PDF (ReportLab) para parsear com MinerU — lento, baixa modelos de OCR a toa e perde estrutura. PDF/imagem/Office continuam no MinerU.
+- Antes de indexar em volume, aplique o override do servico do Ollama (secao Modelos): sem ele o KV cache de 32k em fp16 nao cabe nos 8 GB — medido na pratica: qwen3:4b ocupando 9.5 GB com split 42/58 CPU/GPU; com o override, 5.3 GB e 100% GPU.
+- O qwen3 e modelo hibrido de raciocinio: o engine envia o soft switch `/no_think` (o parametro `think=false` da API nao surte efeito no template) e limpa blocos `<think>` da saida — sem isso a extracao estourava o timeout de 360s por chunk.
+- As referencias citam o nome do arquivo (o LightRAG normaliza `file_path` para o basename). Mapear de volta para o caminho completo do vault — necessario para o link `obsidian://` — fica para a API da Fase 1.
 
 ## Decisoes tomadas
 

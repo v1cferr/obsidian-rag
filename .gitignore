@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Tauri
+frontend/desktop/src-tauri/target/
+
+# Segredos e ambiente local
+.env
+.env.*
+!.env.example
+
+# Dados locais (indice fica fora do repo, mas por garantia)
+data/
+output/
+*.log
